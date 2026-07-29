@@ -30,6 +30,8 @@ add_library(mod_audio_stream SHARED
     mod_audio_stream.h
     audio_streamer_glue.h
     audio_streamer_glue.cpp
+    playback_queue.cpp
+    playback_queue.h
     base64.cpp
 )
 
@@ -40,6 +42,16 @@ target_link_libraries(mod_audio_stream PRIVATE
     pthread
     libwsc
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(playback_queue_test
+        tests/playback_queue_test.cpp
+        playback_queue.cpp
+    )
+    target_compile_options(playback_queue_test PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME playback_queue_test COMMAND playback_queue_test)
+endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "Release")
     set_target_properties(${PROJECT_NAME} 
