@@ -380,8 +380,11 @@ private:
         }
 
         EnqueueAudioResult enqueueResult = EnqueueAudioResult::OVERFLOW;
-        if (queue->isDiscarding() || inRate == outRate) {
-            enqueueResult = queue->enqueueAudio(std::move(rawAudio));
+        if (inRate == outRate) {
+            // 等速率路径：同样按代际校验，flush 后旧流迟到音频不会混入下一句
+            const std::uint64_t queueGeneration = queue->generation();
+            enqueueResult =
+                queue->enqueueAudioIfGeneration(std::move(rawAudio), queueGeneration);
             switch_mutex_unlock(tech_pvt->write_mutex);
         } else {
             switch_mutex_unlock(tech_pvt->write_mutex);
@@ -534,6 +537,21 @@ private:
                 "%s enqueueRawAudio: playback buffer full, dropping %zu input bytes\n",
                 tech_pvt->sessionId,
                 inputBytes);
+        } else if (enqueueResult == EnqueueAudioResult::DISCARDED) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_WARNING,
+                "%s enqueueRawAudio: DISCARDED (generation/discarding), %zu input bytes\n",
+                tech_pvt->sessionId,
+                inputBytes);
+        } else if (enqueueResult == EnqueueAudioResult::QUEUED) {
+            switch_log_printf(
+                SWITCH_CHANNEL_SESSION_LOG(session),
+                SWITCH_LOG_INFO,
+                "%s enqueueRawAudio: QUEUED %zu bytes, buffered=%zu\n",
+                tech_pvt->sessionId,
+                inputBytes,
+                queue->bufferedBytes());
         }
     }
 
@@ -616,8 +634,15 @@ private:
                 switch (pr.kind) {
                     case MessageKind::RAW_AUDIO: {
                         switch_channel_t *ch = switch_core_session_get_channel(psession);
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                                          "STREAMDBG streamAudio received bytes=%zu sampleRate=%d\n",
+                                          pr.rawAudio.size(), pr.sampleRate);
                         if (ch && switch_channel_ready(ch)) {
                             enqueueRawAudio(psession, std::move(pr.rawAudio), pr.sampleRate);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_WARNING,
+                                              "STREAMDBG channel not ready, dropping %zu audio bytes\n",
+                                              pr.rawAudio.size());
                         }
                         break;
                     }
@@ -822,6 +847,20 @@ private:
 
 namespace {
 
+    // G.711 A-law 编码（PCMA）：L16 线性样本 → 8-bit A-law 字节
+    static uint8_t linear2alaw(int16_t pcm) {
+        int sign = (pcm >> 8) & 0x80;
+        int p = pcm;
+        if (sign) p = -p;
+        if (p > 32635) p = 32635;
+        p += 132;
+        int exponent = 7;
+        int exp_mask = 0x4000;
+        while (!(p & exp_mask) && exponent > 0) { exponent--; exp_mask >>= 1; }
+        int mantissa = (p >> (exponent + 3)) & 0x0F;
+        return (uint8_t)((sign | (exponent << 4) | mantissa) ^ 0x55);
+    }
+
     void *SWITCH_THREAD_FUNC write_frame_thread(switch_thread_t *thread, void *obj) {
         switch_core_session_t *session = (switch_core_session_t *)obj;
         switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -883,13 +922,38 @@ namespace {
                           "started write frame thread with sample rate [%u] interval [%u] samples [%u] tsamples [%u] bytes [%u]\n",
                           sample_rate, interval, samples, tsamples, bytes);
 
-        if (switch_core_timer_init(&timer, "soft", interval, tsamples, NULL) != SWITCH_STATUS_SUCCESS) {
+        // RTP 直发（绕过 switch_core_media_write_frame 的媒体方向检查：
+        // 本 fork 的 SDP 协商从不设置 smode（sendrecv 分支缺失），smode 恒为 NONE，
+        // 导致所有 write thread 的下行帧被静默丢弃）
+        switch_rtp_t *rtp_session = switch_core_media_get_rtp_session(session, SWITCH_MEDIA_TYPE_AUDIO);
+
+        // 用 soft timer（hard timer 在本 fork 中不可用，初始化失败）。
+        // soft timer 在会话线程读帧（Lua sleep）时按 20ms 节流，pop 间隙的 busy 空转影响很小。
+        if (switch_core_timer_init(&timer, "soft", interval, tsamples,
+                                   switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Timer Setup Failed. Cannot Start Write Thread\n");
             switch_core_codec_destroy(&write_codec);
             return NULL;
         }
 
+        // switch_rtp_t 不透明，无法读取协商 payload；通道写 codec 为 PCMA（pt=8）时用 8。
+        // 若写 codec 非 PCMA，直发将不兼容（会话协商基本固定 PCMA/PCMU，可接受）。
+        switch_payload_t rtp_payload = 8; /* PCMA */
+        const char *write_codec_name =
+            switch_core_session_get_write_codec(session)
+            && switch_core_session_get_write_codec(session)->implementation
+            ? switch_core_session_get_write_codec(session)->implementation->iananame : "unknown";
+        uint32_t rtp_ts = (uint32_t)(switch_micro_time_now() / 1000);
+        uint8_t pcma_buf[1024];
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                          "write_frame_thread: RTP direct mode rtp_session=%p write_codec=%s payload=%d\n",
+                          (void *) rtp_session, write_codec_name, (int) rtp_payload);
+
         std::vector<std::string> completedMarks;
+        int64_t dbg_iter = 0;
+        int64_t dbg_zero_iters = 0;
+        int64_t dbg_voice_samples = 0;
+        int64_t dbg_total_audio_bytes = 0;
         while (!tech_pvt->close_requested && switch_core_session_running(session)) {
             bool playbackSucceeded = false;
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
@@ -898,20 +962,63 @@ namespace {
                     bytes,
                     completedMarks);
 
+                dbg_iter++;
+                dbg_total_audio_bytes += static_cast<int64_t>(audioBytes);
+                if (audioBytes == 0) {
+                    dbg_zero_iters++;
+                } else {
+                    const int16_t *s = reinterpret_cast<const int16_t *>(write_frame.data);
+                    const size_t n = audioBytes / 2;
+                    int64_t sum = 0;
+                    for (size_t i = 0; i < n; i += 4) sum += (s[i] < 0 ? -s[i] : s[i]);
+                    if (n >= 4 && sum / static_cast<int64_t>(n / 4) > 300) dbg_voice_samples++;
+                }
+                if (dbg_iter % 1000 == 0) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                                      "STREAMDBG write iter=%lld audioBytesTotal=%lld zeroIters=%lld voiceFrames=%lld buffered=%zu mediaFlow=%d\n",
+                                      static_cast<long long>(dbg_iter),
+                                      static_cast<long long>(dbg_total_audio_bytes),
+                                      static_cast<long long>(dbg_zero_iters),
+                                      static_cast<long long>(dbg_voice_samples),
+                                      playbackQueue->bufferedBytes(),
+                                      switch_core_session_media_flow(session, SWITCH_MEDIA_TYPE_AUDIO));
+                }
+
                 playbackSucceeded = audioBytes == 0;
                 if (audioBytes > 0 && switch_channel_ready(channel)) {
                     write_frame.datalen = static_cast<uint32_t>(audioBytes);
                     write_frame.samples = write_frame.datalen / sizeof(spx_int16_t) / channels;
-                    playbackSucceeded =
-                        switch_core_session_write_frame(
-                            session, &write_frame, SWITCH_IO_FLAG_NONE, 0)
-                        == SWITCH_STATUS_SUCCESS;
-                    if (!playbackSucceeded) {
-                        switch_log_printf(
-                            SWITCH_CHANNEL_SESSION_LOG(session),
-                            SWITCH_LOG_WARNING,
-                            "write_frame_thread: Channel write failed; playback marks will not be acknowledged\n");
-                        tech_pvt->close_requested = 1;
+                    const size_t nSamples = write_frame.samples * channels;
+                    if (rtp_session && nSamples <= sizeof(pcma_buf)) {
+                        // RTP 直发：L16 → PCMA 编码 → switch_rtp_write_manual
+                        const int16_t *in = reinterpret_cast<const int16_t *>(write_frame.data);
+                        for (size_t i = 0; i < nSamples; i++) {
+                            pcma_buf[i] = linear2alaw(in[i]);
+                        }
+                        switch_frame_flag_t fflags = 0;
+                        const int ret = switch_rtp_write_manual(
+                            rtp_session, pcma_buf, (uint32_t) nSamples, 0, rtp_payload, rtp_ts, &fflags);
+                        rtp_ts += (uint32_t) nSamples;
+                        playbackSucceeded = ret >= 0;
+                        if (!playbackSucceeded) {
+                            switch_log_printf(
+                                SWITCH_CHANNEL_SESSION_LOG(session),
+                                SWITCH_LOG_WARNING,
+                                "write_frame_thread: RTP direct write failed ret=%d\n", ret);
+                        }
+                    } else {
+                        // fallback：走通道写帧（本 fork 会被媒体方向检查丢弃，仅兜底）
+                        playbackSucceeded =
+                            switch_core_session_write_frame(
+                                session, &write_frame, SWITCH_IO_FLAG_NONE, 0)
+                            == SWITCH_STATUS_SUCCESS;
+                        if (!playbackSucceeded) {
+                            switch_log_printf(
+                                SWITCH_CHANNEL_SESSION_LOG(session),
+                                SWITCH_LOG_WARNING,
+                                "write_frame_thread: Channel write failed; playback marks will not be acknowledged\n");
+                            tech_pvt->close_requested = 1;
+                        }
                     }
                 } else if (!switch_channel_ready(channel)) {
                     playbackSucceeded = false;

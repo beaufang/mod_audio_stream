@@ -160,7 +160,12 @@ FlushResult PlaybackQueue::flush()
     items_.clear();
     bufferedBytes_ = 0;
     pendingMarks_ = 0;
-    discarding_ = !barrierSeenSinceLastAudio_;
+    // 修复：不能在此置 discarding——被打断的旧流迟到音频已由 generation 校验
+    // （enqueueAudioIfGeneration）丢弃。若这里置 true，会把"下一句"的音频也一并
+    // 丢弃，直到下一句的 mark 到达才恢复（mark 又被 invalidate 不回传），表现为
+    // 打断后下一句整句无声、Lua 等 tts.done 超时十几秒。
+    discarding_ = false;
+    barrierSeenSinceLastAudio_ = false;
     ++generation_;
     return FlushResult{invalidatedMarkCount, discarding_};
 }

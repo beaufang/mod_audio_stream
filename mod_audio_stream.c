@@ -94,6 +94,20 @@ static switch_status_t start_capture(switch_core_session_t *session,
         return SWITCH_STATUS_FALSE;
     }
 
+    // 修复：SDP 协商只对 sendonly/recvonly/inactive 调用 set_smode，sendrecv 时 engine->smode
+    // 保持初始 NONE(0)，导致 switch_core_media_write_frame 按媒体方向检查丢弃 write thread 的
+    // 所有下行帧（表现为流式 TTS 无声）。此处强制置为 SENDRECV，与 switch_ivr_check_hold 恢复
+    // 媒体方向的做法一致。
+    // 修复：SDP 协商只对 sendonly/recvonly/inactive 调用 set_smode，sendrecv 时 engine->smode
+    // 保持初始 NONE(0)，导致 switch_core_media_write_frame 按媒体方向检查丢弃 write thread 的
+    // 所有下行帧（表现为流式 TTS 无声）。此处尝试强制置为 SENDRECV；
+    // 注意：运行二进制中该函数疑似空实现（调用后 media_flow 仍为 0），真正绕过手段见
+    // write_frame_thread 的 RTP 直发模式。
+    switch_core_media_set_smode(session, SWITCH_MEDIA_TYPE_AUDIO, SWITCH_MEDIA_FLOW_SENDRECV, SDP_OFFER);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                      "mod_audio_stream: forced audio smode=SENDRECV, media_flow_now=%d\n",
+                      switch_core_session_media_flow(session, SWITCH_MEDIA_TYPE_AUDIO));
+
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
     if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
                                                    wsUri, wsSampling, channels, metadata, &pUserData))
