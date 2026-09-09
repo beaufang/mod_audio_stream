@@ -76,7 +76,7 @@ void testFlushInvalidatesAlreadyQueuedMarker()
     expect(queue.enqueueMark("old-answer") == EnqueueMarkResult::QUEUED,
            "old response marker should be queued");
 
-    const mod_audio_stream::FlushResult flushResult = queue.flush();
+    const mod_audio_stream::FlushResult flushResult = queue.flush(true);
     expect(flushResult.invalidatedMarkCount == 1,
            "flush should report the number of invalidated queued markers");
     expect(!flushResult.discardingLateAudio,
@@ -102,7 +102,7 @@ void testFlushDiscardsLateAudioUntilOldMarkerArrives()
 
     expect(queue.enqueueAudio(oldAudio.data(), oldAudio.size()) == EnqueueAudioResult::QUEUED,
            "old response audio should be queued");
-    const mod_audio_stream::FlushResult flushResult = queue.flush();
+    const mod_audio_stream::FlushResult flushResult = queue.flush(true);
     expect(flushResult.invalidatedMarkCount == 0,
            "flush before the marker should not report an invalidated marker");
     expect(flushResult.discardingLateAudio,
@@ -181,7 +181,7 @@ void testFlushGenerationRejectsInflightOldAudio()
 {
     PlaybackQueue queue(64);
     const std::uint64_t oldGeneration = queue.generation();
-    queue.flush();
+    queue.flush(true);
 
     std::string lateAudio("\x01\x02", 2);
     expect(queue.enqueueAudioIfGeneration(std::move(lateAudio), oldGeneration)
@@ -204,7 +204,7 @@ void testFlushAfterCompletedBarrierAcceptsNextResponse()
     const PlaybackBatch completed = queue.take(8);
     expectMarks(completed, {"old-answer"}, "old response marker should complete");
 
-    const mod_audio_stream::FlushResult flushResult = queue.flush();
+    const mod_audio_stream::FlushResult flushResult = queue.flush(true);
     expect(!flushResult.discardingLateAudio,
            "a completed response barrier must remain visible to a racing flush");
     expect(queue.enqueueAudio(newAudio.data(), newAudio.size()) == EnqueueAudioResult::QUEUED,
@@ -226,7 +226,7 @@ void testFlushRequiresBarrierAfterLatestAudio()
                == EnqueueAudioResult::QUEUED,
            "second response audio should be queued behind the first marker");
 
-    const mod_audio_stream::FlushResult flushResult = queue.flush();
+    const mod_audio_stream::FlushResult flushResult = queue.flush(true);
     expect(flushResult.discardingLateAudio,
            "an older queued marker must not stand in for the latest response barrier");
     expect(queue.enqueueAudio(secondResponse.data(), secondResponse.size())
@@ -234,12 +234,31 @@ void testFlushRequiresBarrierAfterLatestAudio()
            "late audio from the latest interrupted response must be discarded");
 }
 
+void testCancelledResponseWithoutMarkDoesNotSilenceNextResponse()
+{
+    PlaybackQueue queue(64);
+    queue.enqueueAudio(std::string("first"));
+    expect(!queue.take(64).audio.empty(), "first response must play");
+    const auto oldGeneration = queue.generation();
+    queue.flush(); // Legacy TTS cancellation emits no terminal mark.
+    queue.flush(); // Repeated interruption must not poison the next turn.
+    expect(queue.enqueueAudioIfGeneration(std::string("old"), oldGeneration)
+               == EnqueueAudioResult::DISCARDED, "local in-flight PCM must remain invalidated");
+    expect(queue.enqueueAudio(std::string("next")) == EnqueueAudioResult::QUEUED,
+           "missing cancelled mark must not silence the next response");
+    expect(queue.enqueueMark("next") == EnqueueMarkResult::QUEUED,
+           "next response mark must not be consumed as an old barrier");
+    const auto batch = queue.take(64);
+    expectAudio(batch, {'n', 'e', 'x', 't'}, "next response must play after cancellation");
+    expectMarks(batch, {"next"}, "next response must complete without a timeout");
+}
+
 void testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded()
 {
     PlaybackQueue queue(64);
     queue.enqueueAudio(std::string("old PCM"));
-    queue.flush();
-    queue.flush(); // Repeated interrupts must not reopen the old response.
+    queue.flush(true);
+    queue.flush(true); // Repeated interrupts must not reopen the old response.
     const auto currentGeneration = queue.generation();
     expect(queue.enqueueAudioIfGeneration(std::string("late PCM"), currentGeneration)
                == EnqueueAudioResult::DISCARDED,
@@ -254,6 +273,7 @@ void testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded()
 
 int main()
 {
+    testCancelledResponseWithoutMarkDoesNotSilenceNextResponse();
     testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded();
     testMarkerCompletesAtAudioBoundary();
     testFlushInvalidatesAlreadyQueuedMarker();

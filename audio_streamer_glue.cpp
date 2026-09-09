@@ -37,6 +37,7 @@ using mod_audio_stream::FlushResult;
 using mod_audio_stream::PlaybackQueue;
 static mod_audio_stream::CleanupExecutor *cleanupExecutor = nullptr;
 static std::atomic<bool> cleanupFailed{false};
+static switch_thread_rwlock_t *moduleLock = nullptr;
 
 using JsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 
@@ -685,7 +686,7 @@ private:
                 switch (pr.kind) {
                     case MessageKind::RAW_AUDIO: {
                         switch_channel_t *ch = switch_core_session_get_channel(psession);
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                                           "STREAMDBG streamAudio received bytes=%zu sampleRate=%d\n",
                                           pr.rawAudio.size(), pr.sampleRate);
                         if (ch && switch_channel_ready(ch)) {
@@ -1147,10 +1148,17 @@ namespace {
 
     bool retain_session(void *data) {
         auto *tech_pvt = static_cast<private_t *>(data);
-        return switch_core_session_read_lock(tech_pvt->session) == SWITCH_STATUS_SUCCESS;
+        if (moduleLock && switch_thread_rwlock_rdlock(moduleLock) != SWITCH_STATUS_SUCCESS) return false;
+        if (switch_core_session_read_lock(tech_pvt->session) == SWITCH_STATUS_SUCCESS) return true;
+        if (moduleLock) switch_thread_rwlock_unlock(moduleLock);
+        return false;
     }
 
-    void finish_session_cleanup(void *data) {
+    void release_module() {
+        if (moduleLock) switch_thread_rwlock_unlock(moduleLock);
+    }
+
+    bool drain_session(void *data) {
         auto *tech_pvt = static_cast<private_t *>(data);
         switch_core_session_t *session = tech_pvt->session;
         if (tech_pvt->write_thread) {
@@ -1164,7 +1172,7 @@ namespace {
                 cleanupFailed.store(true);
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
                                   "Cannot join playback worker; retaining session to prevent use-after-free\n");
-                return;
+                return false;
             }
         }
         auto *streamer = static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
@@ -1173,6 +1181,13 @@ namespace {
             (*streamer)->disconnect();
             (*streamer)->deleteFiles();
         }
+        return true;
+    }
+
+    void finish_session_cleanup(void *data) {
+        auto *tech_pvt = static_cast<private_t *>(data);
+        switch_core_session_t *session = tech_pvt->session;
+        auto *streamer = static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
         switch_mutex_lock(tech_pvt->resampler_mutex);
         switch_mutex_lock(tech_pvt->mutex);
         tech_pvt->pAudioStreamer = nullptr;
@@ -1186,7 +1201,8 @@ namespace {
 }
 
 extern "C" {
-    switch_status_t stream_module_init(void) {
+    switch_status_t stream_module_init(switch_thread_rwlock_t *module_lock) {
+        moduleLock = module_lock;
         try {
             cleanupExecutor = new mod_audio_stream::CleanupExecutor;
             return SWITCH_STATUS_SUCCESS;
@@ -1365,7 +1381,9 @@ extern "C" {
                               "stream_session_flush failed to lock playback queue\n");
             return SWITCH_STATUS_FALSE;
         }
-        const FlushResult flushResult = queue->flush();
+        const bool waitForTerminalMark = switch_true(
+            switch_channel_get_variable(channel, "STREAM_FLUSH_WAIT_FOR_MARK"));
+        const FlushResult flushResult = queue->flush(waitForTerminalMark);
         writeLock.unlock();
         if (tech_pvt->write_resampler) {
             speex_resampler_reset_mem(tech_pvt->write_resampler);
@@ -1475,7 +1493,7 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
         try {
-            tech_pvt->cleanup_job = cleanupExecutor->reserve(finish_session_cleanup, tech_pvt, retain_session);
+            tech_pvt->cleanup_job = cleanupExecutor->reserve(finish_session_cleanup, tech_pvt, retain_session, drain_session, release_module);
         } catch (const std::exception &) {
             return SWITCH_STATUS_FALSE;
         }

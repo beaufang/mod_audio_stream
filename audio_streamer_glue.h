@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-switch_status_t stream_module_init(void);
+switch_status_t stream_module_init(switch_thread_rwlock_t *module_lock);
 switch_status_t stream_module_shutdown(void);
 int validate_ws_uri(const char *url, char *wsUri);
 switch_status_t is_valid_utf8(const char *str);

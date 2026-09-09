@@ -154,7 +154,7 @@ std::size_t PlaybackQueue::takeInto(
     return written;
 }
 
-FlushResult PlaybackQueue::flush()
+FlushResult PlaybackQueue::flush(bool waitForTerminalMark)
 {
     const std::size_t invalidatedMarkCount = pendingMarks_;
     items_.clear();
@@ -162,7 +162,7 @@ FlushResult PlaybackQueue::flush()
     pendingMarks_ = 0;
     // A generation only identifies work already in flight locally. Network-late
     // PCM has no response ID, so the old mark must remain the ordering barrier.
-    discarding_ = !barrierSeenSinceLastAudio_;
+    discarding_ = waitForTerminalMark && !barrierSeenSinceLastAudio_;
     ++generation_;
     return FlushResult{invalidatedMarkCount, discarding_};
 }

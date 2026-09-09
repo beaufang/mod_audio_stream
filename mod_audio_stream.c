@@ -342,7 +342,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_stream API.\n");
         return SWITCH_STATUS_TERM;
     }
-    if (stream_module_init() != SWITCH_STATUS_SUCCESS) {
+    if (stream_module_init((*module_interface)->rwlock) != SWITCH_STATUS_SUCCESS) {
         switch_event_free_subclass(EVENT_JSON);
         switch_event_free_subclass(EVENT_CONNECT);
         switch_event_free_subclass(EVENT_DISCONNECT);

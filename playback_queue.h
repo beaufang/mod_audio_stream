@@ -48,7 +48,8 @@ public:
     std::size_t takeInto(uint8_t *destination,
                          std::size_t capacity,
                          std::vector<std::string> &completedMarks);
-    FlushResult flush();
+    // Legacy default does not require cancelled responses to emit a mark.
+    FlushResult flush(bool waitForTerminalMark = false);
 
     std::size_t bufferedBytes() const;
     std::size_t availableBytes() const;

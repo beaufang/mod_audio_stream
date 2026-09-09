@@ -43,6 +43,28 @@ struct Session {
 int main() {
     {
         CleanupExecutor executor;
+        struct Blocked { std::promise<void> entered, resume; } blocked;
+        auto job = executor.reserve([](void *) {}, &blocked, nullptr, [](void *p) -> bool {
+            auto &b = *static_cast<Blocked *>(p);
+            b.entered.set_value();
+            b.resume.get_future().wait();
+            return true;
+        });
+        executor.submit(job);
+        blocked.entered.get_future().wait();
+        expect(!executor.shutdown(), "active drain must prevent shutdown");
+        auto start = std::async(std::launch::async, [&] { return executor.reserve([](void *) {}, nullptr); });
+        expect(start.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+               "blocked drain must not block another session start");
+        auto next = start.get();
+        expect(next, "refused shutdown must still accept new sessions");
+        executor.submit(next);
+        blocked.resume.set_value();
+        executor.waitIdle();
+    }
+
+    {
+        CleanupExecutor executor;
         Session session;
         auto *job = executor.reserve(Session::cleanup, &session, Session::retain);
         expect(job && session.alive, "retain must finish before a writer is published");
