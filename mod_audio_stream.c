@@ -29,7 +29,6 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 {
     switch_core_session_t *session = switch_core_media_bug_get_session(bug);
     private_t *tech_pvt = (private_t *)user_data;
-    int channel_closing;
 
     switch (type)
     {
@@ -39,14 +38,13 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
     case SWITCH_ABC_TYPE_CLOSE:
     {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE.\n");
-        // Check if this is a normal channel closure or a requested closure
-        channel_closing = tech_pvt->close_requested ? 0 : 1;
-        stream_session_cleanup(session, NULL, channel_closing);
+        /* Already inside CLOSE: never recursively remove this bug. */
+        stream_session_cleanup(session, NULL, 1);
     }
     break;
 
     case SWITCH_ABC_TYPE_READ:
-        if (tech_pvt->close_requested)
+        if (switch_atomic_read(&tech_pvt->close_requested))
         {
             return SWITCH_FALSE;
         }
@@ -93,20 +91,6 @@ static switch_status_t start_capture(switch_core_session_t *session,
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no read codec available, aborting start\n");
         return SWITCH_STATUS_FALSE;
     }
-
-    // 修复：SDP 协商只对 sendonly/recvonly/inactive 调用 set_smode，sendrecv 时 engine->smode
-    // 保持初始 NONE(0)，导致 switch_core_media_write_frame 按媒体方向检查丢弃 write thread 的
-    // 所有下行帧（表现为流式 TTS 无声）。此处强制置为 SENDRECV，与 switch_ivr_check_hold 恢复
-    // 媒体方向的做法一致。
-    // 修复：SDP 协商只对 sendonly/recvonly/inactive 调用 set_smode，sendrecv 时 engine->smode
-    // 保持初始 NONE(0)，导致 switch_core_media_write_frame 按媒体方向检查丢弃 write thread 的
-    // 所有下行帧（表现为流式 TTS 无声）。此处尝试强制置为 SENDRECV；
-    // 注意：运行二进制中该函数疑似空实现（调用后 media_flow 仍为 0），真正绕过手段见
-    // write_frame_thread 的 RTP 直发模式。
-    switch_core_media_set_smode(session, SWITCH_MEDIA_TYPE_AUDIO, SWITCH_MEDIA_FLOW_SENDRECV, SDP_OFFER);
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                      "mod_audio_stream: forced audio smode=SENDRECV, media_flow_now=%d\n",
-                      switch_core_session_media_flow(session, SWITCH_MEDIA_TYPE_AUDIO));
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
     if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
@@ -358,6 +342,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_stream API.\n");
         return SWITCH_STATUS_TERM;
     }
+    if (stream_module_init() != SWITCH_STATUS_SUCCESS) {
+        switch_event_free_subclass(EVENT_JSON);
+        switch_event_free_subclass(EVENT_CONNECT);
+        switch_event_free_subclass(EVENT_DISCONNECT);
+        switch_event_free_subclass(EVENT_ERROR);
+        return SWITCH_STATUS_TERM;
+    }
     SWITCH_ADD_API(api_interface, "uuid_audio_stream", "audio_stream API", stream_function, STREAM_API_SYNTAX);
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url metadata");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url");
@@ -378,6 +369,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
   Macro expands to: switch_status_t mod_audio_stream_shutdown() */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown)
 {
+    switch_status_t status = stream_module_shutdown();
+    if (status != SWITCH_STATUS_SUCCESS) return status;
     switch_event_free_subclass(EVENT_JSON);
     switch_event_free_subclass(EVENT_CONNECT);
     switch_event_free_subclass(EVENT_DISCONNECT);

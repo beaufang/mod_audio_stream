@@ -147,7 +147,11 @@ Sends a text to the websocket server. Requires a valid `utf-8` text.
 ```
 uuid_audio_stream <uuid> stop <metadata>
 ```
-Stops audio stream and closes websocket connection. If _metadata_ is provided it will be sent before the connection is closed.
+Requests audio-stream shutdown and detaches the stream from the channel. If _metadata_ is provided,
+it is queued before shutdown. `+OK` means shutdown was requested; thread joining and WebSocket
+close complete asynchronously. Already submitted media cannot be recalled. A session reference
+keeps the playback worker and its resources alive until cleanup completes. Module unloading is
+refused while streams or cleanup jobs still need its code.
 
 ```
 uuid_audio_stream <uuid> pause
@@ -213,6 +217,28 @@ Only after all PCM before the mark has been written to the Channel does the modu
 Every response must end with a `playbackMark`, including an interrupted response. After `flush`,
 that old mark acts as the ordering barrier that ends late-audio discard, but it is not acknowledged.
 `markId` is limited to 256 bytes, and at most 1024 uncompleted marks may be queued per call.
+
+The old response's terminal mark is required even if its TTS request was cancelled. Send it before
+any PCM from the next response on the same WebSocket. A local generation counter cannot distinguish
+old and new network messages; omitting that barrier will also discard the next response's audio.
+Playback uses the FreeSWITCH Channel write/codec path, respecting the negotiated codec. There is no
+fixed PCMA payload override or custom G.711 encoder. A mark acknowledges submission to the Channel,
+not delivery to the remote speaker. Validate SDP direction and the deployed FreeSWITCH build if
+Channel writes do not produce audio; do not bypass negotiation with manually constructed RTP.
+
+### Safety regression tests
+
+Run dependency-free queue and cleanup-executor tests with `bash tests/run-unit-tests.sh`.
+With development headers installed, also exercise the module's actual cleanup functions:
+
+```sh
+FREESWITCH_CFLAGS="$(pkg-config --cflags freeswitch speexdsp)" bash tests/run-unit-tests.sh
+FREESWITCH_CFLAGS="$(pkg-config --cflags freeswitch speexdsp)" SANITIZERS=address,undefined bash tests/run-unit-tests.sh
+```
+
+The cleanup test supplies a small FreeSWITCH host double; it is not a live-call test.
+See [safety fix validation](docs/safety-fix-validation.md) for coverage and deployment checks.
+
 
 ## Events
 Module will generate the following event types:

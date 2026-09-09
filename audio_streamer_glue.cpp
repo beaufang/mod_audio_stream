@@ -3,6 +3,7 @@
 #include <algorithm>
 #include "audio_streamer_glue.h"
 #include "playback_queue.h"
+#include "cleanup_executor.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
 #include <fstream>
@@ -34,7 +35,40 @@ using mod_audio_stream::EnqueueAudioResult;
 using mod_audio_stream::EnqueueMarkResult;
 using mod_audio_stream::FlushResult;
 using mod_audio_stream::PlaybackQueue;
+static mod_audio_stream::CleanupExecutor *cleanupExecutor = nullptr;
+static std::atomic<bool> cleanupFailed{false};
+
 using JsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
+
+// Deferred, exception-safe ownership of FreeSWITCH's pool-allocated mutexes.
+class SwitchLock {
+public:
+    explicit SwitchLock(switch_mutex_t *mutex) : mutex_(mutex), owned_(false) {}
+    ~SwitchLock() { unlock(); }
+    SwitchLock(const SwitchLock &) = delete;
+    SwitchLock &operator=(const SwitchLock &) = delete;
+    switch_status_t lock() {
+        const auto status = switch_mutex_lock(mutex_);
+        owned_ = status == SWITCH_STATUS_SUCCESS;
+        return status;
+    }
+    switch_status_t tryLock() {
+        const auto status = switch_mutex_trylock(mutex_);
+        owned_ = status == SWITCH_STATUS_SUCCESS;
+        return status;
+    }
+    void unlock() {
+        if (owned_) { owned_ = false; switch_mutex_unlock(mutex_); }
+    }
+private:
+    switch_mutex_t *mutex_;
+    bool owned_;
+};
+
+struct SessionUnlock {
+    switch_core_session_t *session;
+    ~SessionUnlock() { switch_core_session_rwunlock(session); }
+};
 
 static std::shared_ptr<PlaybackQueue> getPlaybackQueue(private_t *techPvt)
 {
@@ -42,7 +76,7 @@ static std::shared_ptr<PlaybackQueue> getPlaybackQueue(private_t *techPvt)
     if (!techPvt || !techPvt->mutex) return queue;
 
     if (switch_mutex_lock(techPvt->mutex) == SWITCH_STATUS_SUCCESS) {
-        if (techPvt->pPlaybackQueue) {
+        if (!switch_atomic_read(&techPvt->cleanup_started) && techPvt->pPlaybackQueue) {
             auto *queueWrap = static_cast<std::shared_ptr<PlaybackQueue> *>(
                 techPvt->pPlaybackQueue);
             if (queueWrap && *queueWrap) {
@@ -56,14 +90,7 @@ static std::shared_ptr<PlaybackQueue> getPlaybackQueue(private_t *techPvt)
 
 static bool isCloseRequested(private_t *techPvt)
 {
-    if (!techPvt || !techPvt->mutex) return true;
-
-    bool closeRequested = true;
-    if (switch_mutex_lock(techPvt->mutex) == SWITCH_STATUS_SUCCESS) {
-        closeRequested = techPvt->close_requested != 0;
-        switch_mutex_unlock(techPvt->mutex);
-    }
-    return closeRequested;
+    return !techPvt || switch_atomic_read(&techPvt->close_requested) != 0;
 }
 
 class AudioStreamer {
@@ -84,7 +111,7 @@ public:
 
         sp->bindCallbacks(std::weak_ptr<AudioStreamer>(sp));
 
-        sp->client.connect();
+        sp->client->connect();
 
         return sp;
     }
@@ -92,22 +119,29 @@ public:
     ~AudioStreamer()= default;
 
     void disconnect() {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
-        client.disconnect();
+        // Move ownership before joining the event thread. A callback may be in
+        // writeText(), so never hold this mutex while waiting for it to finish.
+        std::unique_ptr<WebSocketClient> closing;
+        {
+            std::lock_guard<std::mutex> lock(m_clientMutex);
+            closing = std::move(client);
+        }
+        if (closing) closing->disconnect();
     }
 
     bool isConnected() {
-        return client.isConnected();
+        std::lock_guard<std::mutex> lock(m_clientMutex);
+        return client && client->isConnected();
     }
 
     void writeBinary(uint8_t* buffer, size_t len) {
-        if(!this->isConnected()) return;
-        client.sendBinary(buffer, len);
+        std::lock_guard<std::mutex> lock(m_clientMutex);
+        if (client && !isCleanedUp() && client->isConnected()) client->sendBinary(buffer, len);
     }
 
     void writeText(const char* text) {
-        if(!this->isConnected()) return;
-        client.sendMessage(text, strlen(text));
+        std::lock_guard<std::mutex> lock(m_clientMutex);
+        if (client && !isCleanedUp() && client->isConnected()) client->sendMessage(text, strlen(text));
     }
 
     void sendPlaybackMarkDone(const std::string &markId) {
@@ -128,15 +162,14 @@ public:
     }
 
     void deleteFiles() {
-        std::vector<std::string> files;
+        std::unordered_set<std::string> files;
 
         {
             std::lock_guard<std::mutex> lk(m_stateMutex);
             if (m_Files.empty())
                 return;
 
-            files.assign(m_Files.begin(), m_Files.end());
-            m_Files.clear();
+            files.swap(m_Files);
             m_playFile = 0;
         }
 
@@ -147,10 +180,8 @@ public:
 
     void markCleanedUp() {
         m_cleanedUp.store(true, std::memory_order_release);
-        client.setMessageCallback({});
-        client.setOpenCallback({});
-        client.setErrorCallback({});
-        client.setCloseCallback({});
+        // Already-running callbacks retain self. disconnect() drains them on
+        // the cleanup worker; clearing callbacks alone cannot cancel them.
     }
 
     bool isCleanedUp() const {
@@ -183,7 +214,7 @@ private:
             }
         }
 
-        client.setUrl(wsUri);
+        client->setUrl(wsUri);
 
         // Setup TLS options
         // NONE - disables validation
@@ -201,20 +232,20 @@ private:
         }
 
         tls.disableHostnameValidation = tls_disable_hostname_validation;
-        client.setTLSOptions(tls);
+        client->setTLSOptions(tls);
 
         // Optional heart beat, sent every xx seconds when there is not any traffic
         // to make sure that load balancers do not kill an idle connection.
         if(heart_beat)
-            client.setPingInterval(heart_beat);
+            client->setPingInterval(heart_beat);
 
         // Per message deflate connection is enabled by default. You can tweak its parameters or disable it
         if(deflate)
-            client.enableCompression(false);
+            client->enableCompression(false);
 
         // Set extra headers if any
         if(!hdrs.empty())
-            client.setHeaders(hdrs);
+            client->setHeaders(hdrs);
     }
 
     enum class MessageKind {
@@ -239,14 +270,23 @@ private:
     }
 
     void bindCallbacks(std::weak_ptr<AudioStreamer> wp) {
-        client.setMessageCallback([wp](const std::string& message) {
+        client->setMessageCallback([wp](const std::string& message) {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
-            self->eventCallback(MESSAGE, message.c_str());
+            try {
+                self->eventCallback(MESSAGE, message.c_str());
+            } catch (const std::exception &e) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                  "WebSocket audio processing failed: %s\n", e.what());
+                if (auto *session = switch_core_session_locate(self->m_sessionId.c_str())) {
+                    SessionUnlock unlock{session};
+                    self->media_bug_close(session);
+                }
+            }
         });
 
-        client.setOpenCallback([wp]() {
+        client->setOpenCallback([wp]() {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
@@ -261,7 +301,7 @@ private:
             switch_safe_free(json_str);
         });
 
-        client.setErrorCallback([wp](int code, const std::string& msg) {
+        client->setErrorCallback([wp](int code, const std::string& msg) {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
@@ -281,7 +321,7 @@ private:
             switch_safe_free(json_str);
         });
 
-        client.setCloseCallback([wp](int code, const std::string& reason) {
+        client->setCloseCallback([wp](int code, const std::string& reason) {
             auto self = wp.lock();
             if (!self) return;
             if (self->isCleanedUp()) return;
@@ -308,6 +348,14 @@ private:
             return nullptr;
         }
         auto *bug = (switch_media_bug_t *) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (isCleanedUp()) return nullptr;
+        if (bug) {
+            auto *tech = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
+            SwitchLock lock(tech->mutex);
+            if (lock.lock() != SWITCH_STATUS_SUCCESS) return nullptr;
+            auto *owner = static_cast<std::shared_ptr<AudioStreamer> *>(tech->pAudioStreamer);
+            if (!owner || owner->get() != this || switch_atomic_read(&tech->cleanup_started)) return nullptr;
+        }
         return bug;
     }
 
@@ -320,9 +368,11 @@ private:
         const std::shared_ptr<PlaybackQueue> queue = getPlaybackQueue(tech_pvt);
         if (!queue) return;
 
-        if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+        SwitchLock writeLock(tech_pvt->write_mutex);
+
+        if (writeLock.lock() == SWITCH_STATUS_SUCCESS) {
             queue->rejectCurrentResponse();
-            switch_mutex_unlock(tech_pvt->write_mutex);
+            writeLock.unlock();
         }
     }
 
@@ -330,7 +380,7 @@ private:
         auto *bug = get_media_bug(session);
         if(bug) {
             auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            tech_pvt->close_requested = 1;
+            switch_atomic_set(&tech_pvt->close_requested, 1);
             switch_core_media_bug_close(&bug, SWITCH_FALSE);
         }
     }
@@ -372,7 +422,10 @@ private:
             return;
         }
 
-        if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
+        SwitchLock writeLock(tech_pvt->write_mutex);
+        SwitchLock resamplerLock(tech_pvt->resampler_mutex);
+
+        if (writeLock.lock() != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
                               "%s enqueueRawAudio: write mutex lock failed, dropping %zu bytes\n",
                               tech_pvt->sessionId, rawAudio.size());
@@ -381,13 +434,13 @@ private:
 
         EnqueueAudioResult enqueueResult = EnqueueAudioResult::OVERFLOW;
         if (inRate == outRate) {
-            // 等速率路径：同样按代际校验，flush 后旧流迟到音频不会混入下一句
+            // The queue barrier rejects network-late PCM; generation handles in-flight work.
             const std::uint64_t queueGeneration = queue->generation();
             enqueueResult =
                 queue->enqueueAudioIfGeneration(std::move(rawAudio), queueGeneration);
-            switch_mutex_unlock(tech_pvt->write_mutex);
+            writeLock.unlock();
         } else {
-            switch_mutex_unlock(tech_pvt->write_mutex);
+            writeLock.unlock();
 
             std::string output;
             int resampleStatus = RESAMPLER_ERR_SUCCESS;
@@ -396,7 +449,7 @@ private:
             spx_uint32_t outLength = 0;
             bool resamplerReady = false;
 
-            if (switch_mutex_lock(tech_pvt->resampler_mutex) != SWITCH_STATUS_SUCCESS) {
+            if (resamplerLock.lock() != SWITCH_STATUS_SUCCESS) {
                 rejectPlaybackResponse(session);
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
@@ -407,12 +460,12 @@ private:
                 return;
             }
             if (isCloseRequested(tech_pvt)) {
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+                resamplerLock.unlock();
                 return;
             }
 
-            if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+            if (writeLock.lock() != SWITCH_STATUS_SUCCESS) {
+                resamplerLock.unlock();
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
                     SWITCH_LOG_WARNING,
@@ -421,8 +474,8 @@ private:
                 return;
             }
             if (queue->isDiscarding()) {
-                switch_mutex_unlock(tech_pvt->write_mutex);
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+                writeLock.unlock();
+                resamplerLock.unlock();
                 return;
             }
             inFrames = static_cast<spx_uint32_t>(
@@ -438,8 +491,8 @@ private:
                 * sizeof(spx_int16_t);
             if (outputCapacityBytes > queue->availableBytes()) {
                 queue->rejectCurrentResponse();
-                switch_mutex_unlock(tech_pvt->write_mutex);
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+                writeLock.unlock();
+                resamplerLock.unlock();
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
                     SWITCH_LOG_WARNING,
@@ -450,7 +503,7 @@ private:
                 return;
             }
             const std::uint64_t queueGeneration = queue->generation();
-            switch_mutex_unlock(tech_pvt->write_mutex);
+            writeLock.unlock();
 
             int initStatus = RESAMPLER_ERR_SUCCESS;
             if (!tech_pvt->write_resampler || tech_pvt->writeResamplerInputRate != inRate) {
@@ -489,7 +542,7 @@ private:
             }
 
             if (!resamplerReady) {
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+                resamplerLock.unlock();
                 rejectPlaybackResponse(session);
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
@@ -502,7 +555,7 @@ private:
                 return;
             }
             if (resampleStatus != RESAMPLER_ERR_SUCCESS || inLength != inFrames) {
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+                resamplerLock.unlock();
                 rejectPlaybackResponse(session);
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
@@ -515,8 +568,8 @@ private:
                 return;
             }
 
-            if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
-                switch_mutex_unlock(tech_pvt->resampler_mutex);
+            if (writeLock.lock() != SWITCH_STATUS_SUCCESS) {
+                resamplerLock.unlock();
                 switch_log_printf(
                     SWITCH_CHANNEL_SESSION_LOG(session),
                     SWITCH_LOG_WARNING,
@@ -526,8 +579,8 @@ private:
             }
             enqueueResult = queue->enqueueAudioIfGeneration(
                 std::move(output), queueGeneration);
-            switch_mutex_unlock(tech_pvt->write_mutex);
-            switch_mutex_unlock(tech_pvt->resampler_mutex);
+            writeLock.unlock();
+            resamplerLock.unlock();
         }
 
         if (enqueueResult == EnqueueAudioResult::OVERFLOW) {
@@ -544,14 +597,7 @@ private:
                 "%s enqueueRawAudio: DISCARDED (generation/discarding), %zu input bytes\n",
                 tech_pvt->sessionId,
                 inputBytes);
-        } else if (enqueueResult == EnqueueAudioResult::QUEUED) {
-            switch_log_printf(
-                SWITCH_CHANNEL_SESSION_LOG(session),
-                SWITCH_LOG_INFO,
-                "%s enqueueRawAudio: QUEUED %zu bytes, buffered=%zu\n",
-                tech_pvt->sessionId,
-                inputBytes,
-                queue->bufferedBytes());
+
         }
     }
 
@@ -564,11 +610,13 @@ private:
         const std::shared_ptr<PlaybackQueue> queue = getPlaybackQueue(tech_pvt);
         if (!queue) return;
 
-        if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
+        SwitchLock writeLock(tech_pvt->write_mutex);
+
+        if (writeLock.lock() != SWITCH_STATUS_SUCCESS) {
             return;
         }
         const EnqueueMarkResult result = queue->enqueueMark(markId);
-        switch_mutex_unlock(tech_pvt->write_mutex);
+        writeLock.unlock();
 
         if (result == EnqueueMarkResult::INVALIDATED) {
             switch_log_printf(
@@ -608,6 +656,9 @@ private:
         if (!psession) {
             return;
         }
+
+        SessionUnlock sessionUnlock{psession};
+        if (isCleanedUp()) return;
 
         for (const auto& e : pr.errors) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_ERROR, "%s\n", e.c_str());
@@ -669,7 +720,6 @@ private:
                 break;
         }
 
-        switch_core_session_rwunlock(psession);
     }
 
 
@@ -835,7 +885,8 @@ private:
 private:
     std::string m_sessionId;
     responseHandler_t m_notify;
-    WebSocketClient client;
+    std::mutex m_clientMutex;
+    std::unique_ptr<WebSocketClient> client{new WebSocketClient};
     bool m_suppress_log;
     const char* m_extra_headers;
     int m_playFile;
@@ -847,46 +898,27 @@ private:
 
 namespace {
 
-    // G.711 A-law 编码（PCMA）：L16 线性样本 → 8-bit A-law 字节
-    static uint8_t linear2alaw(int16_t pcm) {
-        int sign = (pcm >> 8) & 0x80;
-        int p = pcm;
-        if (sign) p = -p;
-        if (p > 32635) p = 32635;
-        p += 132;
-        int exponent = 7;
-        int exp_mask = 0x4000;
-        while (!(p & exp_mask) && exponent > 0) { exponent--; exp_mask >>= 1; }
-        int mantissa = (p >> (exponent + 3)) & 0x0F;
-        return (uint8_t)((sign | (exponent << 4) | mantissa) ^ 0x55);
-    }
+    struct WriterMedia {
+        switch_codec_t codec{};
+        switch_timer_t timer{};
+        bool codecReady = false;
+        bool timerReady = false;
+        ~WriterMedia() {
+            if (timerReady) switch_core_timer_destroy(&timer);
+            if (codecReady) switch_core_codec_destroy(&codec);
+        }
+    };
 
-    void *SWITCH_THREAD_FUNC write_frame_thread(switch_thread_t *thread, void *obj) {
-        switch_core_session_t *session = (switch_core_session_t *)obj;
+    void write_frames(private_t *tech_pvt) {
+        switch_core_session_t *session = tech_pvt->session;
         switch_channel_t *channel = switch_core_session_get_channel(session);
-        if (!channel) return NULL;
-
-        auto *bug = (switch_media_bug_t *)switch_channel_get_private(channel, MY_BUG_NAME);
-        if (!bug) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "no media bug in write frame thread\n");
-            return NULL;
-        }
-
-        private_t *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "write_frame_thread: missing tech_pvt\n");
-            return NULL;
-        }
         const std::shared_ptr<PlaybackQueue> playbackQueue = getPlaybackQueue(tech_pvt);
-        if (!playbackQueue) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                              "write_frame_thread: missing playback queue\n");
-            return NULL;
-        }
+        if (!channel || !playbackQueue || isCloseRequested(tech_pvt)) return;
 
-        switch_timer_t timer = {0};
-        switch_frame_t write_frame = {0};
-        switch_codec_t write_codec = {0};
+        WriterMedia media;
+        switch_timer_t &timer = media.timer;
+        switch_frame_t write_frame = {};
+        switch_codec_t &write_codec = media.codec;
         switch_codec_t *read_codec;
 
         uint32_t sample_rate = tech_pvt->sampling;
@@ -895,21 +927,27 @@ namespace {
         read_codec = switch_core_session_get_read_codec(session);
         if (!read_codec || !read_codec->implementation) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "write_frame_thread: no read codec available, shutting down\n");
-            return NULL;
+            return;
         }
 
         uint32_t interval = read_codec->implementation->microseconds_per_packet / 1000;
         uint32_t samples = switch_samples_per_packet(sample_rate, interval);
-        uint32_t tsamples = read_codec->implementation->actual_samples_per_second;
+        uint32_t tsamples = samples;
         uint32_t bytes = samples * 2 * channels;
+        if (!interval || !bytes || bytes > SWITCH_RECOMMENDED_BUFFER_SIZE) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "Invalid playback frame size or packet interval\n");
+            return;
+        }
 
         if (switch_core_codec_init(&write_codec, "L16", NULL, NULL, sample_rate, interval, channels,
                                    SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
                                    switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "write_frame_thread: Codec Init Failed. Cannot Start Write Thread\n");
-            return NULL;
+            return;
         }
+        media.codecReady = true;
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
                           "Codec Activated L16@%uhz %u channels %dms\n", sample_rate, channels, interval);
         write_frame.codec = &write_codec;
@@ -922,108 +960,51 @@ namespace {
                           "started write frame thread with sample rate [%u] interval [%u] samples [%u] tsamples [%u] bytes [%u]\n",
                           sample_rate, interval, samples, tsamples, bytes);
 
-        // RTP 直发（绕过 switch_core_media_write_frame 的媒体方向检查：
-        // 本 fork 的 SDP 协商从不设置 smode（sendrecv 分支缺失），smode 恒为 NONE，
-        // 导致所有 write thread 的下行帧被静默丢弃）
-        switch_rtp_t *rtp_session = switch_core_media_get_rtp_session(session, SWITCH_MEDIA_TYPE_AUDIO);
-
-        // 用 soft timer（hard timer 在本 fork 中不可用，初始化失败）。
-        // soft timer 在会话线程读帧（Lua sleep）时按 20ms 节流，pop 间隙的 busy 空转影响很小。
         if (switch_core_timer_init(&timer, "soft", interval, tsamples,
                                    switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Timer Setup Failed. Cannot Start Write Thread\n");
-            switch_core_codec_destroy(&write_codec);
-            return NULL;
+            return;
         }
 
-        // switch_rtp_t 不透明，无法读取协商 payload；通道写 codec 为 PCMA（pt=8）时用 8。
-        // 若写 codec 非 PCMA，直发将不兼容（会话协商基本固定 PCMA/PCMU，可接受）。
-        switch_payload_t rtp_payload = 8; /* PCMA */
-        const char *write_codec_name =
-            switch_core_session_get_write_codec(session)
-            && switch_core_session_get_write_codec(session)->implementation
-            ? switch_core_session_get_write_codec(session)->implementation->iananame : "unknown";
-        uint32_t rtp_ts = (uint32_t)(switch_micro_time_now() / 1000);
-        uint8_t pcma_buf[1024];
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                          "write_frame_thread: RTP direct mode rtp_session=%p write_codec=%s payload=%d\n",
-                          (void *) rtp_session, write_codec_name, (int) rtp_payload);
+        media.timerReady = true;
+        SwitchLock writeLock(tech_pvt->write_mutex);
 
         std::vector<std::string> completedMarks;
-        int64_t dbg_iter = 0;
-        int64_t dbg_zero_iters = 0;
-        int64_t dbg_voice_samples = 0;
-        int64_t dbg_total_audio_bytes = 0;
-        while (!tech_pvt->close_requested && switch_core_session_running(session)) {
+        while (!isCloseRequested(tech_pvt) && switch_core_session_running(session)) {
+            if (switch_channel_test_flag(channel, CF_HOLD)
+                || switch_channel_test_flag(channel, CF_AUDIO_PAUSE_WRITE)) {
+                switch_core_timer_next(&timer);
+                continue;
+            }
             bool playbackSucceeded = false;
-            if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+            std::uint64_t batchGeneration = 0;
+            if (writeLock.tryLock() == SWITCH_STATUS_SUCCESS) {
+                batchGeneration = playbackQueue->generation();
                 const size_t audioBytes = playbackQueue->takeInto(
                     static_cast<uint8_t *>(write_frame.data),
                     bytes,
                     completedMarks);
 
-                dbg_iter++;
-                dbg_total_audio_bytes += static_cast<int64_t>(audioBytes);
-                if (audioBytes == 0) {
-                    dbg_zero_iters++;
-                } else {
-                    const int16_t *s = reinterpret_cast<const int16_t *>(write_frame.data);
-                    const size_t n = audioBytes / 2;
-                    int64_t sum = 0;
-                    for (size_t i = 0; i < n; i += 4) sum += (s[i] < 0 ? -s[i] : s[i]);
-                    if (n >= 4 && sum / static_cast<int64_t>(n / 4) > 300) dbg_voice_samples++;
-                }
-                if (dbg_iter % 1000 == 0) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-                                      "STREAMDBG write iter=%lld audioBytesTotal=%lld zeroIters=%lld voiceFrames=%lld buffered=%zu mediaFlow=%d\n",
-                                      static_cast<long long>(dbg_iter),
-                                      static_cast<long long>(dbg_total_audio_bytes),
-                                      static_cast<long long>(dbg_zero_iters),
-                                      static_cast<long long>(dbg_voice_samples),
-                                      playbackQueue->bufferedBytes(),
-                                      switch_core_session_media_flow(session, SWITCH_MEDIA_TYPE_AUDIO));
-                }
-
                 playbackSucceeded = audioBytes == 0;
                 if (audioBytes > 0 && switch_channel_ready(channel)) {
-                    write_frame.datalen = static_cast<uint32_t>(audioBytes);
-                    write_frame.samples = write_frame.datalen / sizeof(spx_int16_t) / channels;
-                    const size_t nSamples = write_frame.samples * channels;
-                    if (rtp_session && nSamples <= sizeof(pcma_buf)) {
-                        // RTP 直发：L16 → PCMA 编码 → switch_rtp_write_manual
-                        const int16_t *in = reinterpret_cast<const int16_t *>(write_frame.data);
-                        for (size_t i = 0; i < nSamples; i++) {
-                            pcma_buf[i] = linear2alaw(in[i]);
-                        }
-                        switch_frame_flag_t fflags = 0;
-                        const int ret = switch_rtp_write_manual(
-                            rtp_session, pcma_buf, (uint32_t) nSamples, 0, rtp_payload, rtp_ts, &fflags);
-                        rtp_ts += (uint32_t) nSamples;
-                        playbackSucceeded = ret >= 0;
-                        if (!playbackSucceeded) {
-                            switch_log_printf(
-                                SWITCH_CHANNEL_SESSION_LOG(session),
-                                SWITCH_LOG_WARNING,
-                                "write_frame_thread: RTP direct write failed ret=%d\n", ret);
-                        }
-                    } else {
-                        // fallback：走通道写帧（本 fork 会被媒体方向检查丢弃，仅兜底）
-                        playbackSucceeded =
-                            switch_core_session_write_frame(
-                                session, &write_frame, SWITCH_IO_FLAG_NONE, 0)
-                            == SWITCH_STATUS_SUCCESS;
-                        if (!playbackSucceeded) {
-                            switch_log_printf(
-                                SWITCH_CHANNEL_SESSION_LOG(session),
-                                SWITCH_LOG_WARNING,
-                                "write_frame_thread: Channel write failed; playback marks will not be acknowledged\n");
-                            tech_pvt->close_requested = 1;
-                        }
+                    // A short final chunk must not remain buffered in the core
+                    // until the next response. Submit a complete packet of PCM.
+                    std::memset(static_cast<uint8_t *>(write_frame.data) + audioBytes, 0, bytes - audioBytes);
+                    write_frame.datalen = bytes;
+                    write_frame.samples = samples;
+                    playbackSucceeded = !isCloseRequested(tech_pvt)
+                        && switch_core_session_write_frame(
+                            session, &write_frame, SWITCH_IO_FLAG_NONE, 0) == SWITCH_STATUS_SUCCESS;
+                    if (!playbackSucceeded) {
+                        // Do not acknowledge this or later marks after a failed write.
+                        switch_atomic_set(&tech_pvt->close_requested, 1);
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                          "Channel playback write failed; stopping stream\n");
                     }
                 } else if (!switch_channel_ready(channel)) {
                     playbackSucceeded = false;
                 }
-                switch_mutex_unlock(tech_pvt->write_mutex);
+                writeLock.unlock();
             } else {
                 completedMarks.clear();
             }
@@ -1040,18 +1021,40 @@ namespace {
                     }
                     switch_mutex_unlock(tech_pvt->mutex);
                 }
-                if (streamer) {
-                    for (const std::string &markId : completedMarks) {
-                        streamer->sendPlaybackMarkDone(markId);
+                if (streamer && writeLock.lock() == SWITCH_STATUS_SUCCESS) {
+                    if (!isCloseRequested(tech_pvt) && batchGeneration == playbackQueue->generation()) {
+                        for (const std::string &markId : completedMarks) streamer->sendPlaybackMarkDone(markId);
                     }
+                    writeLock.unlock();
                 }
             }
             switch_core_timer_next(&timer);
         }
 
-        switch_core_timer_destroy(&timer);
-        switch_core_codec_destroy(&write_codec);
-        return NULL;
+        return;
+    }
+
+    void *SWITCH_THREAD_FUNC write_frame_thread(switch_thread_t *, void *obj) {
+        auto *tech_pvt = static_cast<private_t *>(obj);
+        try {
+            write_frames(tech_pvt);
+        } catch (const std::exception &e) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(tech_pvt->session), SWITCH_LOG_ERROR,
+                              "Playback worker failed: %s\n", e.what());
+        }
+        // Startup and transport failures must also detach the bug and schedule
+        // cleanup. The executor can join this thread after this callback returns.
+        if (!switch_atomic_read(&tech_pvt->cleanup_started)) {
+            stream_session_cleanup(tech_pvt->session, nullptr, 0);
+        }
+        std::shared_ptr<AudioStreamer> streamer;
+        switch_mutex_lock(tech_pvt->mutex);
+        if (tech_pvt->pAudioStreamer) {
+            streamer = *static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
+        }
+        switch_mutex_unlock(tech_pvt->mutex);
+        if (streamer) streamer->disconnect();
+        return nullptr;
     }
 
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
@@ -1065,7 +1068,6 @@ namespace {
 
         switch_memory_pool_t *pool = switch_core_session_get_pool(session);
 
-        memset(tech_pvt, 0, sizeof(private_t));
 
         strncpy(tech_pvt->sessionId, switch_core_session_get_uuid(session), MAX_SESSION_ID);
         strncpy(tech_pvt->ws_uri, wsUri, MAX_WS_URI);
@@ -1075,7 +1077,7 @@ namespace {
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
         tech_pvt->writeChannels = PLAYBACK_CHANNELS;
-        tech_pvt->audio_paused = 0;
+        switch_atomic_set(&tech_pvt->audio_paused, 0);
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
@@ -1089,9 +1091,6 @@ namespace {
 
         tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
 
-        switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
-        switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
-        switch_mutex_init(&tech_pvt->resampler_mutex, SWITCH_MUTEX_NESTED, pool);
         const size_t playbackCapacity =
             static_cast<size_t>(sampling)
             * static_cast<size_t>(tech_pvt->writeChannels)
@@ -1134,18 +1133,8 @@ namespace {
             speex_resampler_destroy(tech_pvt->write_resampler);
             tech_pvt->write_resampler = nullptr;
         }
-        if (tech_pvt->mutex) {
-            switch_mutex_destroy(tech_pvt->mutex);
-            tech_pvt->mutex = nullptr;
-        }
-        if (tech_pvt->write_mutex) {
-            switch_mutex_destroy(tech_pvt->write_mutex);
-            tech_pvt->write_mutex = nullptr;
-        }
-        if (tech_pvt->resampler_mutex) {
-            switch_mutex_destroy(tech_pvt->resampler_mutex);
-            tech_pvt->resampler_mutex = nullptr;
-        }
+        // Pool mutexes are reclaimed with the session, after all session readers
+        // (including concurrent API callers) have released their references.
         if (tech_pvt->read_sbuffer) {
             switch_buffer_destroy(&tech_pvt->read_sbuffer);
             tech_pvt->read_sbuffer = nullptr;
@@ -1156,9 +1145,69 @@ namespace {
         }
     }
 
+    bool retain_session(void *data) {
+        auto *tech_pvt = static_cast<private_t *>(data);
+        return switch_core_session_read_lock(tech_pvt->session) == SWITCH_STATUS_SUCCESS;
+    }
+
+    void finish_session_cleanup(void *data) {
+        auto *tech_pvt = static_cast<private_t *>(data);
+        switch_core_session_t *session = tech_pvt->session;
+        if (tech_pvt->write_thread) {
+            switch_status_t status = SWITCH_STATUS_SUCCESS;
+            // This runs outside all media callbacks/session I/O locks. Retain
+            // the session read lock until both the thread and its APR handle
+            // have been joined; neither is allowed to outlive the session pool.
+            if (switch_thread_join(&status, tech_pvt->write_thread) != SWITCH_STATUS_SUCCESS) {
+                // With exactly one owner, failure means our ownership invariant
+                // is broken. Never free memory a possibly live thread still uses.
+                cleanupFailed.store(true);
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT,
+                                  "Cannot join playback worker; retaining session to prevent use-after-free\n");
+                return;
+            }
+        }
+        auto *streamer = static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
+        if (streamer && *streamer) {
+            (*streamer)->markCleanedUp();
+            (*streamer)->disconnect();
+            (*streamer)->deleteFiles();
+        }
+        switch_mutex_lock(tech_pvt->resampler_mutex);
+        switch_mutex_lock(tech_pvt->mutex);
+        tech_pvt->pAudioStreamer = nullptr;
+        delete streamer;
+        destroy_tech_pvt(tech_pvt);
+        switch_mutex_unlock(tech_pvt->mutex);
+        switch_mutex_unlock(tech_pvt->resampler_mutex);
+        switch_core_session_rwunlock(session);
+    }
+
 }
 
 extern "C" {
+    switch_status_t stream_module_init(void) {
+        try {
+            cleanupExecutor = new mod_audio_stream::CleanupExecutor;
+            return SWITCH_STATUS_SUCCESS;
+        } catch (const std::exception &e) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "Cannot start stream cleanup worker: %s\n", e.what());
+            return SWITCH_STATUS_FALSE;
+        }
+    }
+
+    switch_status_t stream_module_shutdown(void) {
+        if (cleanupFailed.load() || (cleanupExecutor && !cleanupExecutor->shutdown())) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                              "Active audio streams are still cleaning up; retaining module code\n");
+            return SWITCH_STATUS_NOUNLOAD;
+        }
+        delete cleanupExecutor;
+        cleanupExecutor = nullptr;
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     int validate_ws_uri(const char* url, char* wsUri) {
         const char* scheme = nullptr;
         const char* hostStart = nullptr;
@@ -1282,7 +1331,7 @@ extern "C" {
         if (!tech_pvt) return SWITCH_STATUS_FALSE;
 
         switch_core_media_bug_flush(bug);
-        tech_pvt->audio_paused = pause;
+        switch_atomic_set(&tech_pvt->audio_paused, pause);
         return SWITCH_STATUS_SUCCESS;
     }
 
@@ -1298,23 +1347,30 @@ extern "C" {
         const std::shared_ptr<PlaybackQueue> queue = getPlaybackQueue(tech_pvt);
         if (!queue) return SWITCH_STATUS_FALSE;
 
-        if (switch_mutex_lock(tech_pvt->resampler_mutex) != SWITCH_STATUS_SUCCESS) {
+        SwitchLock writeLock(tech_pvt->write_mutex);
+        SwitchLock resamplerLock(tech_pvt->resampler_mutex);
+
+        if (resamplerLock.lock() != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "stream_session_flush failed to lock playback resampler\n");
             return SWITCH_STATUS_FALSE;
         }
-        if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
-            switch_mutex_unlock(tech_pvt->resampler_mutex);
+        if (isCloseRequested(tech_pvt)) {
+            resamplerLock.unlock();
+            return SWITCH_STATUS_FALSE;
+        }
+        if (writeLock.lock() != SWITCH_STATUS_SUCCESS) {
+            resamplerLock.unlock();
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "stream_session_flush failed to lock playback queue\n");
             return SWITCH_STATUS_FALSE;
         }
         const FlushResult flushResult = queue->flush();
-        switch_mutex_unlock(tech_pvt->write_mutex);
+        writeLock.unlock();
         if (tech_pvt->write_resampler) {
             speex_resampler_reset_mem(tech_pvt->write_resampler);
         }
-        switch_mutex_unlock(tech_pvt->resampler_mutex);
+        resamplerLock.unlock();
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                           "stream_session_flush: playback queue cleared, %zu mark(s) invalidated, "
@@ -1410,10 +1466,31 @@ extern "C" {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error allocating memory!\n");
             return SWITCH_STATUS_FALSE;
         }
-        if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, channels,
-                                                        metadata, responseHandler, deflate, heart_beat, suppressLog, rtp_packets,
-                                                        playbackBufferMs,
-                                                        extra_headers, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation)) {
+        memset(tech_pvt, 0, sizeof(*tech_pvt));
+        tech_pvt->session = session;
+        switch_memory_pool_t *pool = switch_core_session_get_pool(session);
+        if (switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS
+            || switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS
+            || switch_mutex_init(&tech_pvt->resampler_mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
+            return SWITCH_STATUS_FALSE;
+        }
+        try {
+            tech_pvt->cleanup_job = cleanupExecutor->reserve(finish_session_cleanup, tech_pvt, retain_session);
+        } catch (const std::exception &) {
+            return SWITCH_STATUS_FALSE;
+        }
+        if (!tech_pvt->cleanup_job) return SWITCH_STATUS_FALSE;
+        try {
+            if (stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, channels,
+                                 metadata, responseHandler, deflate, heart_beat, suppressLog, rtp_packets,
+                                 playbackBufferMs, extra_headers, tls_cafile, tls_keyfile, tls_certfile,
+                                 tls_disable_hostname_validation) != SWITCH_STATUS_SUCCESS) {
+                stream_session_abort(tech_pvt);
+                return SWITCH_STATUS_FALSE;
+            }
+        } catch (const std::exception &e) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "Stream initialization failed: %s\n", e.what());
             stream_session_abort(tech_pvt);
             return SWITCH_STATUS_FALSE;
         }
@@ -1425,38 +1502,44 @@ extern "C" {
 
     switch_status_t stream_session_write_thread_init(switch_core_session_t *session, void *pUserData) {
         private_t *tech_pvt = (private_t *)pUserData;
-        switch_threadattr_t *thd_attr = NULL;
-        switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session));
-        switch_threadattr_detach_set(thd_attr, 0);
-        switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-        return switch_thread_create(
-            &tech_pvt->write_thread,
-            thd_attr,
-            write_frame_thread,
-            session,
-            switch_core_session_get_pool(session));
+        switch_threadattr_t *thd_attr = nullptr;
+        switch_mutex_lock(tech_pvt->mutex);
+        switch_status_t status = SWITCH_STATUS_FALSE;
+        if (!isCloseRequested(tech_pvt)
+            && switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS
+            && switch_threadattr_detach_set(thd_attr, 0) == SWITCH_STATUS_SUCCESS
+            && switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE) == SWITCH_STATUS_SUCCESS) {
+            status = switch_thread_create(&tech_pvt->write_thread, thd_attr, write_frame_thread,
+                                          tech_pvt, switch_core_session_get_pool(session));
+            if (status != SWITCH_STATUS_SUCCESS) tech_pvt->write_thread = nullptr;
+        }
+        // The worker's first mutex acquisition cannot precede publishing its handle.
+        switch_mutex_unlock(tech_pvt->mutex);
+        return status;
     }
 
-    switch_bool_t stream_frame(switch_media_bug_t *bug) {
+    static switch_bool_t stream_frame_impl(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) return SWITCH_TRUE;
-        if (tech_pvt->audio_paused || tech_pvt->cleanup_started) return SWITCH_TRUE;
+        if (switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->cleanup_started)) return SWITCH_TRUE;
         
         std::shared_ptr<AudioStreamer> streamer;
         std::vector<std::vector<uint8_t>> pending_send;
 
-        if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
+        SwitchLock mainLock(tech_pvt->mutex);
+
+        if (mainLock.tryLock() != SWITCH_STATUS_SUCCESS) {
             return SWITCH_TRUE;
         }
 
         if (!tech_pvt->pAudioStreamer) {
-            switch_mutex_unlock(tech_pvt->mutex);
+            mainLock.unlock();
             return SWITCH_TRUE;
         }
 
         auto sp_ptr = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
         if (!sp_ptr || !(*sp_ptr)) {
-            switch_mutex_unlock(tech_pvt->mutex);
+            mainLock.unlock();
             return SWITCH_TRUE;
         }
 
@@ -1573,7 +1656,7 @@ extern "C" {
             }
         }
         
-        switch_mutex_unlock(tech_pvt->mutex);
+        mainLock.unlock();
     
         if (!streamer || !streamer->isConnected()) return SWITCH_TRUE;
 
@@ -1586,163 +1669,71 @@ extern "C" {
         return SWITCH_TRUE;
     }
 
-    switch_status_t stream_session_abort(void *pUserData) {
-        auto *tech_pvt = (private_t *)pUserData;
-        if (!tech_pvt) return SWITCH_STATUS_FALSE;
-
-        if (tech_pvt->pAudioStreamer) {
-            auto *sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
-            if (sp_wrap) {
-                if (*sp_wrap) {
-                    (*sp_wrap)->markCleanedUp();
-                    (*sp_wrap)->disconnect();
-                }
-                delete sp_wrap;
-            }
-            tech_pvt->pAudioStreamer = nullptr;
+    switch_bool_t stream_frame(switch_media_bug_t *bug) {
+        try {
+            return stream_frame_impl(bug);
+        } catch (const std::exception &e) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "Audio capture failed: %s\n", e.what());
+            return SWITCH_FALSE;
         }
-        destroy_tech_pvt(tech_pvt);
+    }
+
+    switch_status_t stream_session_abort(void *pUserData) {
+        auto *tech_pvt = static_cast<private_t *>(pUserData);
+        if (!tech_pvt) return SWITCH_STATUS_FALSE;
+        switch_mutex_lock(tech_pvt->mutex);
+        if (switch_atomic_read(&tech_pvt->cleanup_started)) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_STATUS_SUCCESS;
+        }
+        switch_atomic_set(&tech_pvt->cleanup_started, 1);
+        switch_atomic_set(&tech_pvt->close_requested, 1);
+        if (tech_pvt->pAudioStreamer) {
+            auto *streamer = static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
+            if (*streamer) (*streamer)->markCleanedUp();
+        }
+        auto *job = static_cast<mod_audio_stream::CleanupExecutor::Job *>(tech_pvt->cleanup_job);
+        tech_pvt->cleanup_job = nullptr;
+        switch_mutex_unlock(tech_pvt->mutex);
+        cleanupExecutor->submit(job);
         return SWITCH_STATUS_SUCCESS;
     }
 
     switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
-        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
-        if(bug)
-        {
-            auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            char sessionId[MAX_SESSION_ID];
-            strcpy(sessionId, tech_pvt->sessionId);
-
-            std::shared_ptr<AudioStreamer>* sp_wrap = nullptr;
-            std::shared_ptr<PlaybackQueue>* queue_wrap = nullptr;
-            std::shared_ptr<AudioStreamer> streamer;
-            switch_thread_t *write_thread = nullptr;
-
-            switch_mutex_lock(tech_pvt->mutex);
-
-            if (tech_pvt->cleanup_started) {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_STATUS_SUCCESS;
-            }
-            tech_pvt->cleanup_started = 1;
-            tech_pvt->close_requested = 1;
-
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
-
-            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-
-            sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
-            tech_pvt->pAudioStreamer = nullptr;
-            queue_wrap = static_cast<std::shared_ptr<PlaybackQueue>*>(
-                tech_pvt->pPlaybackQueue);
-            tech_pvt->pPlaybackQueue = nullptr;
-
-            if (sp_wrap && *sp_wrap) {
-                streamer = *sp_wrap;
-            }
-
-            write_thread = tech_pvt->write_thread;
-            tech_pvt->write_thread = nullptr;
-
+        auto *bug = static_cast<switch_media_bug_t *>(switch_channel_get_private(channel, MY_BUG_NAME));
+        if (!bug) return SWITCH_STATUS_FALSE;
+        auto *tech_pvt = static_cast<private_t *>(switch_core_media_bug_get_user_data(bug));
+        switch_mutex_lock(tech_pvt->mutex);
+        if (switch_atomic_read(&tech_pvt->cleanup_started)) {
             switch_mutex_unlock(tech_pvt->mutex);
-
-            if (!channelIsClosing) {
-                switch_core_media_bug_remove(session, &bug);
-            }
-
-            if (sp_wrap) {
-                delete sp_wrap;
-                sp_wrap = nullptr;
-            }
-            if (queue_wrap) {
-                delete queue_wrap;
-                queue_wrap = nullptr;
-            }
-
-            if(streamer) {
-                streamer->deleteFiles();
-                if (text) streamer->writeText(text);
-
-                /* markCleanedUp() nulls all callbacks first so no websocket
-                   event can fire into session context after this point. */
-                streamer->markCleanedUp();
-
-                if (!channelIsClosing) {
-                    /* Explicit stop runs outside session teardown. */
-                    streamer->disconnect();
-                } else {
-                    /* WebSocket close may wait for its bounded handshake timer;
-                       retain ownership off the session teardown path. */
-                    std::shared_ptr<AudioStreamer> closingStreamer = std::move(streamer);
-                    std::thread([closingStreamer]() {
-                        closingStreamer->disconnect();
-                    }).detach();
-                }
-            }
-
-            if (write_thread) {
-                if (!channelIsClosing) {
-                    /* Explicit stop (uuid_audio_stream stop, etc.): safe to join because
-                       we are NOT in the session teardown path, so write_frame_thread can
-                       still call switch_core_session_write_frame() without deadlocking. */
-                    switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
-                    switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
-                    if (join_result != SWITCH_STATUS_SUCCESS) {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                          "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
-                                          sessionId, join_result);
-                    }
-                } else {
-                    /* Far-end hangup path (channelIsClosing=1): called from SWITCH_ABC_TYPE_CLOSE
-                       while the FreeSWITCH session teardown holds the session I/O lock.
-                       Joining here would deadlock: write_frame_thread blocks inside
-                       switch_core_session_write_frame() waiting for that same lock.
-                       close_requested=1 (set above) causes the write thread to exit its loop
-                       within one timer tick (~20ms); switch_channel_ready() guards the actual
-                       write call so it never blocks on a dead channel. The thread exits safely
-                       before the session pool is freed. */
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-                                      "(%s) stream_session_cleanup: skipping write thread join on channel close "
-                                      "(close_requested set, thread will self-exit)\n", sessionId);
-                }
-            }
-
-            if (!channelIsClosing) {
-                /* Full cleanup when we own the teardown. */
-                destroy_tech_pvt(tech_pvt);
-            } else {
-                /* Channel-closing path: only free heap-allocated resources.
-                   Pool-allocated objects (write_mutex, thread state, etc.) must remain
-                   valid until the write thread exits; they will be reclaimed with the
-                   session pool, which is freed after all callbacks complete. The write
-                   thread keeps its own shared_ptr to the playback queue. */
-                if (tech_pvt->read_resampler) {
-                    speex_resampler_destroy(tech_pvt->read_resampler);
-                    tech_pvt->read_resampler = nullptr;
-                }
-                if (tech_pvt->resampler_mutex
-                    && switch_mutex_lock(tech_pvt->resampler_mutex) == SWITCH_STATUS_SUCCESS) {
-                    if (tech_pvt->write_resampler) {
-                        speex_resampler_destroy(tech_pvt->write_resampler);
-                        tech_pvt->write_resampler = nullptr;
-                    }
-                    switch_mutex_unlock(tech_pvt->resampler_mutex);
-                } else if (tech_pvt->write_resampler) {
-                    switch_log_printf(
-                        SWITCH_CHANNEL_SESSION_LOG(session),
-                        SWITCH_LOG_WARNING,
-                        "(%s) stream_session_cleanup: preserving write resampler because "
-                        "its mutex could not be acquired\n",
-                        sessionId);
-                }
-            }
-
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
             return SWITCH_STATUS_SUCCESS;
         }
-
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "stream_session_cleanup: no bug - websocket connection already closed\n");
-        return SWITCH_STATUS_FALSE;
+        switch_atomic_set(&tech_pvt->cleanup_started, 1);
+        switch_atomic_set(&tech_pvt->close_requested, 1);
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+        if (tech_pvt->pAudioStreamer) {
+            auto *streamer = static_cast<std::shared_ptr<AudioStreamer> *>(tech_pvt->pAudioStreamer);
+            if (*streamer) {
+                if (text) {
+                    try { (*streamer)->writeText(text); }
+                    catch (const std::exception &e) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                          "Cannot send final stream text: %s\n", e.what());
+                    }
+                }
+                (*streamer)->markCleanedUp();
+            }
+        }
+        auto *job = static_cast<mod_audio_stream::CleanupExecutor::Job *>(tech_pvt->cleanup_job);
+        tech_pvt->cleanup_job = nullptr;
+        switch_mutex_unlock(tech_pvt->mutex);
+        // The CLOSE callback must not recursively remove its own bug.
+        if (!channelIsClosing) switch_core_media_bug_remove(session, &bug);
+        // Both explicit stop and hangup use the same nonblocking cleanup path.
+        // The reserved job owns the session reference until after join+disconnect.
+        cleanupExecutor->submit(job);
+        return SWITCH_STATUS_SUCCESS;
     }
 }

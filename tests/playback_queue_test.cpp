@@ -234,10 +234,27 @@ void testFlushRequiresBarrierAfterLatestAudio()
            "late audio from the latest interrupted response must be discarded");
 }
 
+void testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded()
+{
+    PlaybackQueue queue(64);
+    queue.enqueueAudio(std::string("old PCM"));
+    queue.flush();
+    queue.flush(); // Repeated interrupts must not reopen the old response.
+    const auto currentGeneration = queue.generation();
+    expect(queue.enqueueAudioIfGeneration(std::string("late PCM"), currentGeneration)
+               == EnqueueAudioResult::DISCARDED,
+           "current generation cannot identify a network-late old response");
+    expect(queue.enqueueMark("interrupted") == EnqueueMarkResult::INVALIDATED,
+           "old response mark must never be acknowledged");
+    expect(queue.enqueueAudio(std::string("new PCM")) == EnqueueAudioResult::QUEUED,
+           "next response must be audible immediately after the old mark");
+}
+
 }
 
 int main()
 {
+    testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded();
     testMarkerCompletesAtAudioBoundary();
     testFlushInvalidatesAlreadyQueuedMarker();
     testFlushDiscardsLateAudioUntilOldMarkerArrives();

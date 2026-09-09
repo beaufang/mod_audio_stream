@@ -31,9 +31,11 @@ struct private_data
     int writeResamplerInputRate;
     int channels;
     int writeChannels;
-    int audio_paused : 1;
-    int close_requested : 1;
-    int cleanup_started : 1;
+    switch_atomic_t audio_paused;
+    switch_atomic_t close_requested;
+    switch_atomic_t cleanup_started;
+    switch_core_session_t *session;
+    void *cleanup_job;
     char initialMetadata[8192];
     switch_buffer_t *read_sbuffer;
     void *pPlaybackQueue;

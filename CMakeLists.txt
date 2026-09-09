@@ -37,6 +37,9 @@ add_library(mod_audio_stream SHARED
 
 set_property(TARGET mod_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)
 
+target_include_directories(mod_audio_stream PRIVATE ${SPEEXDSP_INCLUDE_DIRS})
+target_link_libraries(mod_audio_stream PRIVATE ${SPEEXDSP_LIBRARIES})
+
 target_link_libraries(mod_audio_stream PRIVATE 
     PkgConfig::FreeSWITCH 
     pthread
@@ -51,6 +54,20 @@ if(BUILD_TESTING)
     )
     target_compile_options(playback_queue_test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME playback_queue_test COMMAND playback_queue_test)
+    add_executable(cleanup_executor_test tests/cleanup_executor_test.cpp)
+    target_compile_options(cleanup_executor_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(cleanup_executor_test PRIVATE pthread)
+    add_test(NAME cleanup_executor_test COMMAND cleanup_executor_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_executable(session_cleanup_test tests/session_cleanup_test.cpp playback_queue.cpp)
+        target_include_directories(session_cleanup_test PRIVATE
+            ${FreeSWITCH_INCLUDE_DIRS} ${SPEEXDSP_INCLUDE_DIRS} libs/libwsc/src)
+        target_compile_options(session_cleanup_test PRIVATE
+            ${FreeSWITCH_CFLAGS_OTHER} -ffunction-sections -fdata-sections)
+        target_link_options(session_cleanup_test PRIVATE -Wl,--gc-sections)
+        target_link_libraries(session_cleanup_test PRIVATE pthread)
+        add_test(NAME session_cleanup_test COMMAND session_cleanup_test)
+    endif()
 endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "Release")
