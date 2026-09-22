@@ -43,6 +43,11 @@ struct private_data
     switch_mutex_t *resampler_mutex;
     switch_thread_t *write_thread;
     int rtp_packets;
+    /* Set from the asr.start metadata ("dtmfRelay": true). Only then does the
+     * read-bug poll consume the channel DTMF queue and forward digits to the
+     * gateway over WS; entries that still rely on a Lua input callback (e.g.
+     * the legacy realtime gateway) keep their digits untouched. */
+    int dtmf_relay;
 };
 
 typedef struct private_data private_t;

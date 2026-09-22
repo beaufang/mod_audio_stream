@@ -1,5 +1,6 @@
 #include <string>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 #include "audio_streamer_glue.h"
 #include "playback_queue.h"
@@ -160,6 +161,13 @@ public:
             writeText(json);
             switch_safe_free(json);
         }
+    }
+
+    void sendDtmfDigit(char digit) {
+        char payload[64];
+        std::snprintf(payload, sizeof(payload),
+                      "{\"type\":\"dtmf\",\"data\":{\"digit\":\"%c\"}}", digit);
+        writeText(payload);
     }
 
     void deleteFiles() {
@@ -1080,7 +1088,18 @@ namespace {
         tech_pvt->writeChannels = PLAYBACK_CHANNELS;
         switch_atomic_set(&tech_pvt->audio_paused, 0);
 
-        if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
+        if (metadata) {
+            strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
+            JsonPtr meta(cJSON_Parse(metadata), &cJSON_Delete);
+            const cJSON *relay = meta ? cJSON_GetObjectItem(meta.get(), "dtmfRelay") : nullptr;
+            if (cJSON_IsTrue(relay)
+                || (cJSON_IsNumber(relay) && relay->valuedouble != 0)) {
+                tech_pvt->dtmf_relay = 1;
+            }
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                              "(%s) dtmf relay %s\n",
+                              tech_pvt->sessionId, tech_pvt->dtmf_relay ? "enabled" : "disabled");
+        }
 
         //size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
         const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
@@ -1562,6 +1581,22 @@ extern "C" {
         }
 
         streamer = *sp_ptr;
+
+        // Park-based Lua entries no longer consume DTMF themselves; when the
+        // gateway asked for relay (asr.start "dtmfRelay": true) forward the
+        // channel DTMF queue over the same WS before streaming read audio.
+        if (tech_pvt->dtmf_relay) {
+            switch_channel_t *dtmf_channel = switch_core_session_get_channel(tech_pvt->session);
+            if (dtmf_channel) {
+                switch_dtmf_t dtmf = {};
+                while (switch_channel_dequeue_dtmf(dtmf_channel, &dtmf) == SWITCH_STATUS_SUCCESS) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(tech_pvt->session), SWITCH_LOG_INFO,
+                                      "(%s) forwarding DTMF %c to gateway\n",
+                                      tech_pvt->sessionId, (char)dtmf.digit);
+                    streamer->sendDtmfDigit(static_cast<char>(dtmf.digit));
+                }
+            }
+        }
 
         auto *resampler = tech_pvt->read_resampler;
         const int channels = tech_pvt->channels;
