@@ -269,12 +269,43 @@ void testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded()
            "next response must be audible immediately after the old mark");
 }
 
+void testStrictFlushWithoutOldMarkDiscardsNextResponseUntilItsOwnMark()
+{
+    // STREAM_FLUSH_WAIT_FOR_MARK 的既定契约(见 README):打断后旧响应的终结
+    // mark 必须先于任何新响应 PCM 到达,否则新响应整句被丢、其 mark 被吞不上
+    // 报。该用例固定此边界,上游若补发 mark 则不会走到这里;协议引入响应 ID
+    // 或窗口超时后此断言应同步修改。
+    PlaybackQueue queue(64);
+    queue.enqueueAudio(std::string("interrupted"));
+
+    const auto flushResult = queue.flush(true);
+    expect(flushResult.discardingLateAudio,
+           "flush before the terminal mark must open the discard window");
+    expect(queue.isDiscarding(), "discard window stays open while the old mark is missing");
+
+    expect(queue.enqueueAudio(std::string("next answer"))
+               == EnqueueAudioResult::DISCARDED,
+           "next response PCM is discarded while the old mark is missing (known strict-mode cost)");
+    expect(queue.enqueueMark("next-answer") == EnqueueMarkResult::INVALIDATED,
+           "the next response mark closes the window and is not acknowledged");
+    expect(!queue.isDiscarding(), "any mark closes the discard window");
+
+    expect(queue.enqueueAudio(std::string("second answer")) == EnqueueAudioResult::QUEUED,
+           "responses after the window closes must be audible again");
+    const auto batch = queue.take(64);
+    expectAudio(batch,
+                std::vector<uint8_t>{'s', 'e', 'c', 'o', 'n', 'd', ' ', 'a', 'n', 's', 'w', 'e', 'r'},
+                "the response after the discarded turn must play");
+    expectMarks(batch, {}, "the swallowed mark must not complete");
+}
+
 }
 
 int main()
 {
     testCancelledResponseWithoutMarkDoesNotSilenceNextResponse();
     testNetworkLateAudioUsesCurrentGenerationButIsStillDiscarded();
+    testStrictFlushWithoutOldMarkDiscardsNextResponseUntilItsOwnMark();
     testMarkerCompletesAtAudioBoundary();
     testFlushInvalidatesAlreadyQueuedMarker();
     testFlushDiscardsLateAudioUntilOldMarkerArrives();

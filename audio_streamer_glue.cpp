@@ -979,6 +979,12 @@ namespace {
         SwitchLock writeLock(tech_pvt->write_mutex);
 
         std::vector<std::string> completedMarks;
+        // 20ms 节拍统计,每 500 个成功 tick(约 10s)输出一次:区分下行静音的三种
+        // 来源——队列空转(idleTicks 占满,上游未送 PCM)、上游送零(audioTicks 高
+        // 但 nonZeroBytes 为 0)、帧写入后被静默丢弃(audioTicks 与 nonZeroBytes
+        // 均正常但通话无声)。
+        std::uint64_t statIdleTicks = 0, statAudioTicks = 0;
+        std::uint64_t statAudioBytes = 0, statNonZeroBytes = 0;
         while (!isCloseRequested(tech_pvt) && switch_core_session_running(session)) {
             if (switch_channel_test_flag(channel, CF_HOLD)
                 || switch_channel_test_flag(channel, CF_AUDIO_PAUSE_WRITE)) {
@@ -994,11 +1000,37 @@ namespace {
                     bytes,
                     completedMarks);
 
+                if (audioBytes == 0) {
+                    ++statIdleTicks;
+                } else {
+                    ++statAudioTicks;
+                    statAudioBytes += audioBytes;
+                    const uint8_t *pcm = static_cast<const uint8_t *>(write_frame.data);
+                    for (size_t i = 0; i < audioBytes; ++i) {
+                        if (pcm[i] != 0) ++statNonZeroBytes;
+                    }
+                }
+                if (statIdleTicks + statAudioTicks >= 500) {
+                    switch_log_printf(
+                        SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                        "%s playback stats: idleTicks=%llu audioTicks=%llu "
+                        "audioBytes=%llu nonZeroBytes=%llu\n",
+                        tech_pvt->sessionId,
+                        static_cast<unsigned long long>(statIdleTicks),
+                        static_cast<unsigned long long>(statAudioTicks),
+                        static_cast<unsigned long long>(statAudioBytes),
+                        static_cast<unsigned long long>(statNonZeroBytes));
+                    statIdleTicks = statAudioTicks = 0;
+                    statAudioBytes = statNonZeroBytes = 0;
+                }
+
                 playbackSucceeded = audioBytes == 0;
                 if (audioBytes > 0 && switch_channel_ready(channel)) {
                     // A short final chunk must not remain buffered in the core
                     // until the next response. Submit a complete packet of PCM.
                     std::memset(static_cast<uint8_t *>(write_frame.data) + audioBytes, 0, bytes - audioBytes);
+                    // 帧对象跨 tick 复用,每帧显式清空标记,不继承任何下层设置
+                    write_frame.flags = 0;
                     write_frame.datalen = bytes;
                     write_frame.samples = samples;
                     playbackSucceeded = !isCloseRequested(tech_pvt)
